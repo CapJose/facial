@@ -1,0 +1,23 @@
+# ===== Base web =====
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+python-multipart>=0.0.20,<1
+
+# ===== Imagen / modelos =====
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+Pillow>=11.3,<13
+onnxruntime>=1.20,<2
+
+# ===== MongoDB (async) + GridFS =====
+motor>=3.6,<4
+pymongo>=4.9,<5
+
+# ===== DNS (resolver custom para SRV de Mongo Atlas) =====
+dnspython>=2.6,<3
+
+# ===== HTTP async (Telegram, ipwhois) =====
+httpx>=0.27,<1
+
+# ===== Otros =====
+anyio>=4.4,<5

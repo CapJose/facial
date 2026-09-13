@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Verificación facial en vivo</title>
+<style>
+[hidden]{display:none!important}:root{color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0d1320;color:#eef3fc}*{box-sizing:border-box}body{margin:0;padding:24px 16px}main{max-width:1050px;margin:auto}h1{font-size:clamp(25px,5vw,40px);margin:8px 0}h2{font-size:20px;margin:0 0 12px}p{color:#aebbd0;line-height:1.55}.tag{color:#73e6c1;font-size:12px;font-weight:800;letter-spacing:2px}.card{background:#172134;border:1px solid #2d405d;border-radius:18px;padding:20px;margin-top:18px}.settings{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}label{display:block;font-weight:700;margin-bottom:8px}input{width:100%;padding:12px;border-radius:10px;border:1px solid #465c7d;background:#0e1726;color:inherit;font:inherit}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:15px}button{border:0;border-radius:10px;padding:12px 18px;font:inherit;font-weight:750;cursor:pointer;background:#73e6c1;color:#09251d}button.secondary{background:#304462;color:#fff}button.stop{background:#ff9d90;color:#33100b}button:disabled{opacity:.42;cursor:default}button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #73e6c1;outline-offset:3px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr);gap:18px}.camera{position:relative;aspect-ratio:4/3;background:#080d16;border-radius:15px;overflow:hidden;display:grid;place-items:center}.camera video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}.camera.back video{transform:none}.camera canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.placeholder{text-align:center;padding:28px;color:#8fa0b8}.live{position:absolute;left:14px;top:14px;display:flex;align-items:center;gap:7px;background:#0a111dcc;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800}.dot{width:9px;height:9px;border-radius:50%;background:#8592a6}.running .dot{background:#ff665d;box-shadow:0 0 0 4px #ff665d33}.guide{position:absolute;inset:12% 25%;border:2px dashed #ffffff88;border-radius:48% 48% 44% 44%;pointer-events:none}.status{font-size:22px;font-weight:800;margin:0 0 10px}.pass{color:#73e6c1}.fail{color:#ff9d90}.pending{color:#f2d17f}.muted{font-size:13px;color:#9daec5}.metrics{display:grid;grid-template-columns:1fr;gap:9px;margin:15px 0}.metric{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#0e1726;border-radius:10px}.metric b{font-size:13px}.yes{color:#73e6c1}.no{color:#ff9d90}.unknown{color:#f2d17f}ul{padding-left:20px;line-height:1.6}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1726;padding:13px;border-radius:10px;font-size:12px;max-height:260px;overflow:auto}summary{cursor:pointer;color:#b9c8dd}.notice{border-left:3px solid #f2d17f;padding-left:13px}.connection{font-size:13px;color:#aebbd0}code{color:#c6f7e6}@media(max-width:760px){body{padding:16px 10px}.layout{grid-template-columns:1fr}.settings{grid-template-columns:1fr}.card{padding:15px}.camera{aspect-ratio:3/4}.guide{inset:14% 18%}}
+</style>
+</head>
+<body>
+<main>
+<div class="tag">FASTAPI · CÁMARA EN VIVO</div>
+<h1>Evaluación facial en tiempo real</h1>
+<p>La cámara frontal toma fotogramas automáticamente y muestra si el rostro está bien ubicado, recto y sin gafas.</p>
+<div id="securityNotice" class="card notice" hidden>La cámara requiere HTTPS o una dirección local segura. Abre esta página desde <code>http://127.0.0.1:5501</code> o desde un dominio con HTTPS.</div>
+<section class="card settings">
+<div><label for="apiUrl">Dirección de FastAPI</label><input id="apiUrl" type="url" value="http://localhost:8080" spellcheck="false" autocomplete="url"></div>
+<div><button id="health" type="button" class="secondary">Probar conexión</button></div>
+<div id="connection" class="connection" role="status" aria-live="polite">Conexión sin comprobar.</div>
+</section>
+<div class="layout">
+<section class="card">
+<div id="cameraBox" class="camera">
+<video id="video" autoplay muted playsinline hidden></video>
+<canvas id="overlay"></canvas>
+<div id="guide" class="guide" hidden></div>
+<div id="placeholder" class="placeholder">Pulsa «Iniciar cámara» y acepta el permiso.</div>
+<div id="liveBadge" class="live"><span class="dot"></span><span id="liveText">DETENIDO</span></div>
+</div>
+<div class="row">
+<button id="start" type="button">Iniciar cámara</button>
+<button id="stop" type="button" class="stop" hidden>Detener</button>
+<button id="switch" type="button" class="secondary" hidden>Cambiar cámara</button>
+</div>
+<p class="muted">La velocidad depende de tu servidor y del modelo. Solo se envía el siguiente fotograma cuando termina el anterior.</p>
+</section>
+<section class="card" aria-live="polite">
+<h2 id="status" class="status">Cámara detenida</h2>
+<p id="description">Inicia la cámara para comenzar.</p>
+<div class="metrics">
+<div class="metric"><b>Rostro</b><span id="faceState" class="unknown">Sin evaluar</span></div>
+<div class="metric"><b>Posición</b><span id="positionState" class="unknown">Sin evaluar</span></div>
+<div class="metric"><b>Inclinación</b><span id="tiltState" class="unknown">Sin evaluar</span></div>
+<div class="metric"><b>Gafas</b><span id="glassesState" class="unknown">Sin evaluar</span></div>
+</div>
+<ul id="messages"></ul>
+<p id="latency" class="muted"></p>
+<details id="details" hidden><summary>Ver respuesta completa</summary><pre id="json"></pre></details>
+</section>
+</div>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const SAMPLE_DELAY_MS = 900;
+const REQUEST_TIMEOUT_MS = 120000;
+const MAX_FRAME_SIDE = 720;
+let stream = null;
+let activeRequest = null;
+let detectionRun = 0;
+let facingMode = 'user';
+let running = false;
+
+$('securityNotice').hidden = window.isSecureContext && !!navigator.mediaDevices?.getUserMedia;
+if (location.protocol !== 'file:') $('apiUrl').value = ['5500','5501'].includes(location.port) ? 'http://localhost:8080' : location.origin;
+
+function endpoint(path) {
+  const url = new URL($('apiUrl').value.trim());
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('La URL de la API no es válida.');
+  url.search = ''; url.hash = '';
+  url.pathname = url.pathname.replace(/\/(?:verificar-rostro|health|docs)\/?$/, '').replace(/\/$/, '') + path;
+  if (location.protocol === 'https:' && url.protocol === 'http:') throw new Error('Esta página usa HTTPS; la API también debe usar HTTPS.');
+  return url.toString();
+}
+function networkMessage() {
+  return 'No se pudo conectar. Verifica FastAPI, el puerto 8080 y CORS para ' + location.origin + '.';
+}
+async function fetchJSON(url, options = {}) {
+  const response = await fetch(url, {...options, cache: 'no-store'});
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('La API respondió HTTP ' + response.status + ' sin JSON.'); }
+  return {response, data};
+}
+function setMetric(id, text, state='unknown') {
+  const element = $(id); element.textContent = text; element.className = state;
+}
+function resetMetrics() {
+  setMetric('faceState','Sin evaluar'); setMetric('positionState','Sin evaluar');
+  setMetric('tiltState','Sin evaluar'); setMetric('glassesState','Sin evaluar');
+}
+function setStatus(title, description, state='') {
+  $('status').textContent = title; $('status').className = 'status ' + state;
+  $('description').textContent = description;
+}
+function clearOverlay() {
+  const canvas = $('overlay');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+function drawBox(details, approved) {
+  clearOverlay();
+  const box = details?.bbox, analyzed = details?.imagen_analizada;
+  if (!box || !analyzed?.ancho || !analyzed?.alto) return;
+  const video = $('video'), canvas = $('overlay');
+  const rect = video.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.round(rect.width * devicePixelRatio));
+  canvas.height = Math.max(1, Math.round(rect.height * devicePixelRatio));
+  const scale = devicePixelRatio;
+  const sourceRatio = analyzed.ancho / analyzed.alto;
+  const viewRatio = rect.width / rect.height;
+  let shownW, shownH, offsetX, offsetY;
+  if (sourceRatio > viewRatio) { shownH = rect.height; shownW = shownH * sourceRatio; offsetX = (rect.width-shownW)/2; offsetY=0; }
+  else { shownW = rect.width; shownH = shownW/sourceRatio; offsetX=0; offsetY=(rect.height-shownH)/2; }
+  let x = offsetX + box.x / analyzed.ancho * shownW;
+  const y = offsetY + box.y / analyzed.alto * shownH;
+  const w = box.ancho / analyzed.ancho * shownW;
+  const h = box.alto / analyzed.alto * shownH;
+  if (facingMode === 'user') x = rect.width - x - w;
+  const ctx = canvas.getContext('2d');
+  ctx.lineWidth = 4 * scale; ctx.strokeStyle = approved ? '#73e6c1' : '#ff9d90';
+  ctx.strokeRect(x*scale, y*scale, w*scale, h*scale);
+}
+function renderResult(data, elapsed) {
+  const details = data?.detalles || {};
+  const count = Number(details.rostros_detectados ?? 0);
+  setMetric('faceState', count === 1 ? '1 detectado' : count + ' detectados', count === 1 ? 'yes' : 'no');
+  setMetric('positionState', details.posicion_ok === true ? 'Correcta' : details.posicion_ok === false ? 'Incorrecta' : 'No evaluada', details.posicion_ok === true ? 'yes' : details.posicion_ok === false ? 'no' : 'unknown');
+  setMetric('tiltState', details.inclinacion_ok === true ? 'Correcta' : details.inclinacion_ok === false ? 'Incorrecta' : 'No evaluada', details.inclinacion_ok === true ? 'yes' : details.inclinacion_ok === false ? 'no' : 'unknown');
+  const glasses = details.gafas || {};
+  setMetric('glassesState', glasses.detectadas === false ? 'Sin gafas' : glasses.detectadas === true ? 'Con gafas' : 'No evaluadas', glasses.detectadas === false ? 'yes' : glasses.detectadas === true ? 'no' : 'unknown');
+  if (data.apto === true) setStatus('Condiciones correctas', 'Mantén esta posición.', 'pass');
+  else setStatus('Ajusta la foto', 'Sigue las indicaciones para continuar.', 'pending');
+  $('messages').replaceChildren();
+  for (const message of Array.isArray(data.mensajes) ? data.mensajes : []) {
+    const li = document.createElement('li'); li.textContent = String(message); $('messages').appendChild(li);
+  }
+  $('latency').textContent = 'Última evaluación: ' + (elapsed/1000).toFixed(1) + ' s';
+  $('json').textContent = JSON.stringify(data, null, 2); $('details').hidden = false;
+  drawBox(details, data.apto === true);
+}
+function cameraError(error) {
+  if (error.name === 'NotAllowedError') return 'Permiso de cámara rechazado. Permítelo en la configuración del navegador.';
+  if (error.name === 'NotFoundError') return 'No se encontró una cámara disponible.';
+  if (error.name === 'NotReadableError') return 'Otra aplicación está usando la cámara.';
+  if (!window.isSecureContext) return 'La cámara requiere HTTPS o localhost.';
+  return 'No se pudo abrir la cámara: ' + error.message;
+}
+function waitVideo(video) {
+  if (video.readyState >= 2 && video.videoWidth) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('La cámara no entregó imagen.')), 15000);
+    video.addEventListener('loadeddata', () => { clearTimeout(timer); resolve(); }, {once:true});
+  });
+}
+async function startCamera() {
+  if (running) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) {
+    setStatus('Cámara no disponible', 'Abre la página con HTTPS o desde 127.0.0.1/localhost.', 'fail'); return;
+  }
+  $('start').disabled = true;
+  setStatus('Abriendo cámara…', 'Acepta el permiso del navegador.', 'pending');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facingMode},width:{ideal:1280},height:{ideal:960}},audio:false});
+    const video = $('video'); video.srcObject = stream; await video.play(); await waitVideo(video);
+    running = true; detectionRun++;
+    video.hidden = false; $('placeholder').hidden = true; $('guide').hidden = false;
+    $('cameraBox').classList.toggle('back', facingMode !== 'user');
+    $('liveBadge').classList.add('running'); $('liveText').textContent = 'EN VIVO';
+    $('start').hidden = true; $('stop').hidden = false; $('switch').hidden = false;
+    setStatus('Analizando…', 'Espera la primera respuesta.', 'pending'); resetMetrics();
+    detectionLoop(detectionRun);
+  } catch (error) {
+    stopCamera(false); setStatus('No se abrió la cámara', cameraError(error), 'fail');
+  } finally { $('start').disabled = false; }
+}
+function stopCamera(update=true) {
+  running = false; detectionRun++;
+  activeRequest?.abort(); activeRequest = null;
+  stream?.getTracks().forEach(track => track.stop()); stream = null;
+  $('video').srcObject = null; $('video').hidden = true; $('placeholder').hidden = false; $('guide').hidden = true;
+  $('liveBadge').classList.remove('running'); $('liveText').textContent = 'DETENIDO';
+  $('start').hidden = false; $('stop').hidden = true; $('switch').hidden = true; clearOverlay();
+  if (update) { setStatus('Cámara detenida', 'Pulsa «Iniciar cámara» para continuar.'); resetMetrics(); $('messages').replaceChildren(); }
+}
+async function frameBlob() {
+  const video = $('video');
+  const ratio = Math.min(1, MAX_FRAME_SIDE / Math.max(video.videoWidth, video.videoHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(video.videoWidth * ratio));
+  canvas.height = Math.max(1, Math.round(video.videoHeight * ratio));
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('No se pudo capturar el fotograma.')), 'image/jpeg', .88));
+}
+async function detectionLoop(run) {
+  while (running && run === detectionRun) {
+    const started = performance.now();
+    const controller = new AbortController(); activeRequest = controller;
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const blob = await frameBlob();
+      const body = new FormData(); body.append('image', blob, 'captura-live.jpg');
+      const {response, data} = await fetchJSON(endpoint('/verificar-rostro'), {method:'POST',body,signal:controller.signal});
+      if (!running || run !== detectionRun) break;
+      if (!response.ok) {
+        const retry = Number(response.headers.get('Retry-After') || 0);
+        setStatus('API no disponible', 'HTTP ' + response.status + (retry ? '. Reintentando…' : ''), 'fail');
+        if (retry) await new Promise(r => setTimeout(r, retry*1000));
+      } else if (typeof data.apto !== 'boolean') setStatus('Respuesta inesperada', 'Falta el campo apto.', 'fail');
+      else renderResult(data, performance.now()-started);
+    } catch (error) {
+      if (!running || run !== detectionRun) break;
+      setStatus(error.name === 'AbortError' ? 'La API tardó demasiado' : 'Error de conexión', error.name === 'AbortError' ? 'Se volverá a intentar.' : networkMessage(), 'fail');
+    } finally { clearTimeout(timer); if (activeRequest === controller) activeRequest = null; }
+    if (running && run === detectionRun) await new Promise(resolve => setTimeout(resolve, SAMPLE_DELAY_MS));
+  }
+}
+$('start').addEventListener('click', startCamera);
+$('stop').addEventListener('click', () => stopCamera());
+$('switch').addEventListener('click', async () => { facingMode = facingMode === 'user' ? 'environment' : 'user'; stopCamera(false); await startCamera(); });
+$('health').addEventListener('click', async () => {
+  $('health').disabled = true; $('connection').textContent = 'Comprobando…';
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const {response,data} = await fetchJSON(endpoint('/health'), {signal:controller.signal});
+    $('connection').textContent = response.ok && data.status === 'ok' ? 'API conectada y modelos listos.' : 'La API respondió HTTP ' + response.status + '.';
+  } catch(error) { $('connection').textContent = error.name === 'AbortError' ? 'La API no respondió en 15 segundos.' : networkMessage(); }
+  finally { clearTimeout(timer); $('health').disabled = false; }
+});
+window.addEventListener('pagehide', () => stopCamera(false));
+window.addEventListener('resize', clearOverlay);
+</script>
+</body>
+</html>
