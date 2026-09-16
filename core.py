@@ -239,3 +239,262 @@ def evaluar(engine, raw):
     if glasses['detectadas']:
         return reply(False, ['Quítate las gafas para continuar.'], details)
     return reply(True, ['Todo correcto: rostro bien posicionado, recto y sin gafas.'], details)
+
+
+# ============================================================
+# MOTOR: DETECCIÓN DE DOCUMENTO DE IDENTIDAD
+# ============================================================
+DOC_ASPECT_RATIOS = (1.586, 1.500, 1.420, 1.350, 0.65, 0.70)
+DOC_ASPECT_TOLERANCE = 0.18
+DOC_MIN_AREA_RATIO = 0.18
+DOC_MAX_AREA_RATIO = 0.98
+DOC_MIN_SHARPNESS = 35.0
+DOC_MIN_SIDE_PX = 180
+DOC_MIN_TEXT_CONTRAST = 25.0
+DOC_BLUR_KERNEL = (5, 5)
+
+DOC_MODEL_PATH = Path(os.getenv('DOC_MODEL_PATH', str(MODEL_DIR / 'documento-int8.onnx')))
+DOC_META_PATH = Path(os.getenv('DOC_META_PATH', str(MODEL_DIR / 'documento-meta.json')))
+DOC_LABEL_MAP = {'document': True, 'no%20document': False, 'documento': True, 'no_documento': False}
+DOC_THRESHOLD = 0.80
+
+
+def _ordenar_quad(points: np.ndarray) -> np.ndarray:
+    pts = points.reshape(4, 2).astype(np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+    return np.array([
+        pts[np.argmin(s)],
+        pts[np.argmin(d)],
+        pts[np.argmax(s)],
+        pts[np.argmax(d)],
+    ], dtype=np.float32)
+
+
+def _ratio_documento(quad: np.ndarray):
+    tl, tr, br, bl = quad
+    ancho = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
+    alto = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
+    if alto <= 0:
+        return 0.0, 0.0, 0.0
+    return ancho, alto, ancho / alto
+
+
+def _aspecto_valido(ratio: float) -> bool:
+    for objetivo in DOC_ASPECT_RATIOS:
+        if abs(ratio - objetivo) / objetivo <= DOC_ASPECT_TOLERANCE:
+            return True
+        inv = 1.0 / objetivo
+        if abs(ratio - inv) / inv <= DOC_ASPECT_TOLERANCE:
+            return True
+    return False
+
+
+def _nitidez(gray: np.ndarray) -> float:
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _contraste_texto(gray: np.ndarray) -> float:
+    h, w = gray.shape[:2]
+    y1, y2 = int(h * 0.20), int(h * 0.80)
+    x1, x2 = int(w * 0.20), int(w * 0.80)
+    zona = gray[y1:y2, x1:x2]
+    return float(zona.std()) if zona.size else 0.0
+
+
+def _cargar_clasificador_documento():
+    import onnxruntime as ort
+    meta = json.loads(DOC_META_PATH.read_text(encoding='utf-8'))
+    labels = meta.get('labels')
+    if not isinstance(labels, list) or not labels:
+        raise RuntimeError('Etiquetas de documento inválidas.')
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = max(1, int(os.getenv('ORT_INTRA_THREADS', '2')))
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(
+        str(DOC_MODEL_PATH), sess_options=options,
+        providers=['CPUExecutionProvider']
+    )
+    inputs, outputs = session.get_inputs(), session.get_outputs()
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise RuntimeError('Firma ONNX de documento inesperada.')
+    sample = np.zeros(
+        (1, 3, int(meta['size']['height']), int(meta['size']['width'])),
+        dtype=np.float32
+    )
+    session.run([outputs[0].name], {inputs[0].name: sample})
+    analizar_documento._session = session
+    analizar_documento._meta = meta
+    analizar_documento._labels = labels
+    analizar_documento._input_name = inputs[0].name
+    analizar_documento._output_name = outputs[0].name
+    log.info('Clasificador de documento ONNX listo.')
+
+
+def analizar_documento(bgr: np.ndarray):
+    h, w = bgr.shape[:2]
+    resultado = {
+        'detectado': False, 'quad': None, 'bbox': None,
+        'ratio': 0.0, 'area_ratio': 0.0,
+        'nitidez': 0.0, 'contraste': 0.0,
+        'mensajes': [], 'motivos': [],
+    }
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, DOC_BLUR_KERNEL, 0)
+
+    edges = cv2.Canny(gray, 40, 120)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contornos, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        resultado['mensajes'].append('No se detectó ningún documento. Colócalo sobre una superficie plana y con buen contraste.')
+        resultado['motivos'].append('sin_contornos')
+        return resultado
+
+    area_frame = float(w * h)
+    candidatos = []
+    for c in contornos:
+        area = cv2.contourArea(c)
+        if area < area_frame * 0.05:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quad = _ordenar_quad(approx)
+            ancho, alto, ratio = _ratio_documento(quad)
+            if ancho < DOC_MIN_SIDE_PX or alto < DOC_MIN_SIDE_PX:
+                continue
+            area_ratio = area / area_frame
+            candidatos.append({
+                'quad': quad, 'area': area, 'ratio': ratio,
+                'ancho': ancho, 'alto': alto, 'area_ratio': area_ratio,
+            })
+
+    if not candidatos:
+        resultado['mensajes'].append('No se reconoció la forma del documento. Enmárcalo completo y evita fondos con patrones.')
+        resultado['motivos'].append('sin_quad')
+        return resultado
+
+    candidatos.sort(key=lambda c: c['area'], reverse=True)
+    mejor = candidatos[0]
+    quad = mejor['quad']
+    xs, ys = quad[:, 0], quad[:, 1]
+    x1, y1 = int(max(0, xs.min())), int(max(0, ys.min()))
+    x2, y2 = int(min(w, xs.max())), int(min(h, ys.max()))
+    bbox = (x1, y1, x2 - x1, y2 - y1)
+
+    resultado.update({
+        'quad': quad.tolist(),
+        'bbox': bbox,
+        'ratio': round(mejor['ratio'], 3),
+        'area_ratio': round(mejor['area_ratio'], 4),
+    })
+
+    if not _aspecto_valido(mejor['ratio']):
+        resultado['mensajes'].append('La forma detectada no corresponde a un documento de identidad. Muéstralo completo y sin tapar bordes.')
+        resultado['motivos'].append('aspecto_invalido')
+        return resultado
+
+    if mejor['area_ratio'] < DOC_MIN_AREA_RATIO:
+        resultado['mensajes'].append('Acerca el documento a la cámara para que ocupe más espacio.')
+        resultado['motivos'].append('area_pequena')
+        return resultado
+    if mejor['area_ratio'] > DOC_MAX_AREA_RATIO:
+        resultado['mensajes'].append('El documento está demasiado cerca o cortado. Aléjalo un poco.')
+        resultado['motivos'].append('area_grande')
+        return resultado
+
+    roi = bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        resultado['mensajes'].append('Recorte inválido del documento.')
+        resultado['motivos'].append('roi_vacio')
+        return resultado
+
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    nitidez = _nitidez(gray_roi)
+    contraste = _contraste_texto(gray_roi)
+    resultado['nitidez'] = round(nitidez, 2)
+    resultado['contraste'] = round(contraste, 2)
+
+    if nitidez < DOC_MIN_SHARPNESS:
+        resultado['mensajes'].append('La imagen está borrosa. Mantén el pulso firme y enfoca el documento.')
+        resultado['motivos'].append('borroso')
+        return resultado
+    if contraste < DOC_MIN_TEXT_CONTRAST:
+        resultado['mensajes'].append('No se distingue el contenido del documento. Mejora la iluminación.')
+        resultado['motivos'].append('bajo_contraste')
+        return resultado
+
+    if DOC_MODEL_PATH.is_file() and DOC_META_PATH.is_file():
+        try:
+            if not hasattr(analizar_documento, '_session'):
+                _cargar_clasificador_documento()
+            session = analizar_documento._session
+            meta = analizar_documento._meta
+            labels = analizar_documento._labels
+            input_name = analizar_documento._input_name
+            output_name = analizar_documento._output_name
+            crop_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            tensor = preprocess_glasses(Image.fromarray(crop_rgb), meta)
+            logits = session.run([output_name], {input_name: tensor})[0]
+            probs = softmax(logits)
+            scores = {lab: float(p) for lab, p in zip(labels, probs)}
+            top = max(scores, key=scores.get)
+            conf = scores[top]
+            resultado['clasificador'] = {
+                'etiqueta': top,
+                'confianza': round(conf, 4),
+                'puntuaciones': {k: round(v, 4) for k, v in scores.items()},
+            }
+            es_doc = DOC_LABEL_MAP.get(top)
+            if es_doc is False and conf >= DOC_THRESHOLD:
+                resultado['mensajes'].append('Lo detectado no parece un documento de identidad válido.')
+                resultado['motivos'].append('clasificador_rechaza')
+                return resultado
+            if es_doc is None and conf >= DOC_THRESHOLD:
+                resultado['mensajes'].append('No se pudo confirmar que sea un documento de identidad.')
+                resultado['motivos'].append('clasificador_incierto')
+                return resultado
+        except Exception as e:
+            log.warning(f'Clasificador de documento falló: {e}')
+
+    resultado['detectado'] = True
+    resultado['mensajes'].append('Documento de identidad detectado correctamente.')
+    return resultado
+
+
+def evaluar_documento(engine, raw, esperado: str = "documento"):
+    """
+    Verifica que en la imagen haya un documento de identidad.
+    `engine` puede ser None (no usa modelos ONNX, solo OpenCV).
+    `esperado`: 'documento' | 'dni' | 'pasaporte' (informativo).
+    """
+    bgr, original_size = cargar_imagen(raw)
+    h, w = bgr.shape[:2]
+    info = analizar_documento(bgr)
+    details = {
+        'imagen_original': {'ancho': original_size[0], 'alto': original_size[1]},
+        'imagen_analizada': {'ancho': w, 'alto': h},
+        'tipo_esperado': esperado,
+        'documento': {
+            'detectado': info['detectado'],
+            'ratio': info['ratio'],
+            'area_ratio': info['area_ratio'],
+            'nitidez': info['nitidez'],
+            'contraste': info['contraste'],
+            'motivos': info['motivos'],
+        },
+    }
+    if info.get('bbox'):
+        details['documento']['bbox'] = dict(zip(('x', 'y', 'ancho', 'alto'), info['bbox']))
+    if info.get('clasificador'):
+        details['documento']['clasificador'] = info['clasificador']
+
+    if not info['detectado']:
+        mensajes = info['mensajes'] or ['No se pudo verificar el documento.']
+        return reply(False, mensajes, details)
+    return reply(True, ['Documento de identidad verificado correctamente.'], details)
