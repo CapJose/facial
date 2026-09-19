@@ -21,4 +21,4 @@ httpx>=0.27,<1
 
 # ===== Otros =====
 anyio>=4.4,<5
-PyJWT
+PyJWT>=2.8,<3
